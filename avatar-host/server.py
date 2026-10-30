@@ -1,5 +1,7 @@
 """X1 avatar host - the app's own talking-portrait service."""
 
+import hashlib
+import hmac
 import os
 import subprocess
 import threading
@@ -37,6 +39,21 @@ def auth(authorization: Optional[str]):
         raise HTTPException(500, "HOST_TOKEN is not set on this container")
     if not authorization or authorization.replace("Bearer ", "").strip() != TOKEN:
         raise HTTPException(401, "Unauthorized")
+
+
+def allow(authorization: Optional[str], path: str, exp: Optional[str], sig: Optional[str]):
+    """Bearer token, or a short-lived signature the app mints for a video/image tag."""
+    if authorization and TOKEN and authorization.replace("Bearer ", "").strip() == TOKEN:
+        return
+    if exp and sig:
+        try:
+            if int(exp) >= time.time():
+                want = hmac.new(TOKEN.encode(), (path + "." + str(exp)).encode(), hashlib.sha256).hexdigest()
+                if hmac.compare_digest(want, sig):
+                    return
+        except ValueError:
+            pass
+    raise HTTPException(401, "Unauthorized")
 
 
 def tail(text: bytes, size: int = 400) -> str:
@@ -131,8 +148,8 @@ async def upload_avatar(file: UploadFile = File(...), authorization: Optional[st
 
 
 @app.get("/avatar")
-def get_avatar(authorization: Optional[str] = Header(None)):
-    auth(authorization)
+def get_avatar(authorization: Optional[str] = Header(None), exp: Optional[str] = None, sig: Optional[str] = None):
+    allow(authorization, "/avatar", exp, sig)
     if not AVATAR.exists():
         raise HTTPException(404, "No image has been uploaded yet")
     return FileResponse(AVATAR)
@@ -171,8 +188,8 @@ def get_render(job_id: str, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/renders/{job_id}.mp4")
-def get_video(job_id: str, authorization: Optional[str] = Header(None)):
-    auth(authorization)
+def get_video(job_id: str, authorization: Optional[str] = Header(None), exp: Optional[str] = None, sig: Optional[str] = None):
+    allow(authorization, "/renders/" + job_id + ".mp4", exp, sig)
     path = RENDERS / (job_id + ".mp4")
     if not path.exists():
         raise HTTPException(404, "That render has no video yet")
