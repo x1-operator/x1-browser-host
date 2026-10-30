@@ -1,0 +1,18 @@
+{
+  "name": "x1-browser-host",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Self-hosted browser runtime for X1 Apex Factory: sessions, live frames, contexts, page actions.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.47.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
