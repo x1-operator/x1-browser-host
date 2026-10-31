@@ -5,6 +5,7 @@ re-encode), turns text into speech with a local voice model, and re-syncs her mo
 with Wav2Lip. One bearer token guards everything.
 """
 
+import json
 import os
 import subprocess
 import threading
@@ -13,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 import uvicorn
 
@@ -204,6 +205,107 @@ def get_render(job_id: str, authorization: Optional[str] = Header(None)):
     if not job:
         raise HTTPException(404, "No such render")
     return {"ok": True, "job": job}
+
+
+# ---- speech: the same engine, offered as a voice service (parity with voice-host/) -----------
+VOICES = DATA / "voices"
+VOICES.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+
+VOICE_PRESETS = [
+    {"id": "preset:river", "name": "River", "kind": "preset", "note": "calm, neutral"},
+    {"id": "preset:honey", "name": "Honey", "kind": "preset", "note": "warm, soft"},
+    {"id": "preset:sunny", "name": "Sunny", "kind": "preset", "note": "bright, upbeat"},
+    {"id": "preset:storm", "name": "Storm", "kind": "preset", "note": "formal, authoritative"},
+]
+
+
+@app.get("/voices")
+def list_voices(authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    clones = []
+    for item in sorted(VOICES.glob("*.json")):
+        try:
+            clones.append(json.loads(item.read_text()))
+        except Exception:
+            continue
+    return {"ok": True, "voices": VOICE_PRESETS + clones}
+
+
+@app.post("/speak")
+def speak_text(payload: dict, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+    if len(text) > MAX_CHARS:
+        raise HTTPException(400, f"text is limited to {MAX_CHARS} characters")
+    voice_id = str(payload.get("voice_id") or "preset:river")
+    if voice_id.startswith("clone-"):
+        raise HTTPException(
+            409,
+            "Clone synthesis needs the XTTS-v2 engine, which this container does not carry. "
+            "The reference audio is stored and kept on the volume.",
+        )
+    job_id = f"sp-{uuid.uuid4().hex[:12]}"
+    out = RENDERS / f"{job_id}.wav"
+    speak(text, out)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "voice_id": voice_id,
+        "bytes": out.stat().st_size,
+        "url": f"/voice/{job_id}.wav",
+        "chars": len(text),
+    }
+
+
+@app.post("/clone")
+async def upload_clone(
+    file: UploadFile = File(...),
+    name: str = Form("Unnamed clone"),
+    authorization: Optional[str] = Header(None),
+):
+    auth(authorization)
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(400, "empty upload")
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"reference audio is limited to {MAX_UPLOAD_BYTES} bytes")
+    if payload[:4] != b"RIFF":
+        raise HTTPException(400, "reference audio must be a WAV file")
+    voice_id = f"clone-{uuid.uuid4().hex[:12]}"
+    (VOICES / f"{voice_id}.wav").write_bytes(payload)
+    meta = {
+        "id": voice_id,
+        "name": (name or "Unnamed clone")[:80],
+        "kind": "clone",
+        "bytes": len(payload),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "note": "reference audio is private to this volume",
+    }
+    (VOICES / f"{voice_id}.json").write_text(json.dumps(meta))
+    return {"ok": True, "voice": meta}
+
+
+# The .wav route is registered before the plain id route: a path parameter matches dots, so the
+# other order answers a download with a JSON lookup.
+@app.get("/voice/{job_id}.wav")
+def get_voice_wav(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    path = RENDERS / f"{job_id}.wav"
+    if not path.exists():
+        raise HTTPException(404, "No such render")
+    return FileResponse(path, media_type="audio/wav", filename=f"{job_id}.wav")
+
+
+@app.get("/voice/{job_id}")
+def get_voice_meta(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    path = RENDERS / f"{job_id}.wav"
+    if not path.exists():
+        raise HTTPException(404, "No such render")
+    return {"ok": True, "job_id": job_id, "bytes": path.stat().st_size, "url": f"/voice/{job_id}.wav"}
 
 
 if __name__ == "__main__":
