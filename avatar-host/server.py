@@ -30,6 +30,8 @@ RENDERS.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="X1 avatar host")
 JOBS = {}
+for _existing in RENDERS.glob("*.mp4"):
+    JOBS.setdefault(_existing.stem, {"id": _existing.stem, "status": "done", "chars": 0, "text": "", "video_url": "/renders/" + _existing.stem + ".mp4"})
 LOCK = threading.Lock()
 USAGE = {"renders": 0, "seconds": 0.0, "started_at": time.time()}
 
@@ -178,15 +180,6 @@ def list_renders(authorization: Optional[str] = Header(None)):
     return {"ok": True, "count": len(items), "items": items[:50], "usage": USAGE}
 
 
-@app.get("/renders/{job_id}")
-def get_render(job_id: str, authorization: Optional[str] = Header(None)):
-    auth(authorization)
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "No such render")
-    return {"ok": True, "job": job}
-
-
 @app.get("/renders/{job_id}.mp4")
 def get_video(job_id: str, authorization: Optional[str] = Header(None), exp: Optional[str] = None, sig: Optional[str] = None):
     allow(authorization, "/renders/" + job_id + ".mp4", exp, sig)
@@ -194,6 +187,15 @@ def get_video(job_id: str, authorization: Optional[str] = Header(None), exp: Opt
     if not path.exists():
         raise HTTPException(404, "That render has no video yet")
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/renders/{job_id}")
+def get_render(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "No such render")
+    return {"ok": True, "job": job}
 
 
 if __name__ == "__main__":
