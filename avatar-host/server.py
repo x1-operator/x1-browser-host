@@ -7,9 +7,11 @@ with Wav2Lip. One bearer token guards everything.
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -207,29 +209,267 @@ def get_render(job_id: str, authorization: Optional[str] = Header(None)):
     return {"ok": True, "job": job}
 
 
-# ---- speech: the same engine, offered as a voice service (parity with voice-host/) -----------
+# ---- the voice system: catalogue, prosody, emotion, long-form, cloning, history ---------------
 VOICES = DATA / "voices"
-VOICES.mkdir(parents=True, exist_ok=True)
+PIPER = DATA / "piper"
+for path in (VOICES, PIPER):
+    path.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+HF_VOICES = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
-VOICE_PRESETS = [
-    {"id": "preset:river", "name": "River", "kind": "preset", "note": "calm, neutral"},
-    {"id": "preset:honey", "name": "Honey", "kind": "preset", "note": "warm, soft"},
-    {"id": "preset:sunny", "name": "Sunny", "kind": "preset", "note": "bright, upbeat"},
-    {"id": "preset:storm", "name": "Storm", "kind": "preset", "note": "formal, authoritative"},
+# Emotion is prosody, not a vendor call: it moves rate, pitch, gain and pause length together.
+EMOTIONS = {
+    "neutral": {"rate": 1.0, "pitch": 0.0, "gain": 1.0, "pause": 1.0},
+    "warm": {"rate": 0.96, "pitch": -0.6, "gain": 1.0, "pause": 1.15},
+    "excited": {"rate": 1.12, "pitch": 1.8, "gain": 1.12, "pause": 0.85},
+    "calm": {"rate": 0.92, "pitch": -1.0, "gain": 0.96, "pause": 1.25},
+    "serious": {"rate": 0.95, "pitch": -1.8, "gain": 1.04, "pause": 1.1},
+    "sad": {"rate": 0.9, "pitch": -2.2, "gain": 0.92, "pause": 1.3},
+}
+
+PRESETS = [
+    {"id": "preset:river", "name": "River", "kind": "preset", "language": "en-US",
+     "note": "calm, neutral", "defaults": {"speed": 1.0, "pitch": 0, "volume": 1.0, "emotion": "neutral"}},
+    {"id": "preset:honey", "name": "Honey", "kind": "preset", "language": "en-US",
+     "note": "warm, soft", "defaults": {"speed": 0.96, "pitch": -0.8, "volume": 0.98, "emotion": "warm"}},
+    {"id": "preset:sunny", "name": "Sunny", "kind": "preset", "language": "en-US",
+     "note": "bright, upbeat", "defaults": {"speed": 1.08, "pitch": 1.6, "volume": 1.05, "emotion": "excited"}},
+    {"id": "preset:storm", "name": "Storm", "kind": "preset", "language": "en-US",
+     "note": "formal, authoritative", "defaults": {"speed": 0.95, "pitch": -1.8, "volume": 1.04, "emotion": "serious"}},
 ]
+
+
+def piper_models():
+    found = []
+    baked = Path(VOICE)
+    if baked.exists():
+        found.append({"id": "model:default", "name": "Amy (baked)", "path": baked, "kind": "model",
+                      "language": "en-US", "note": "shipped in the image"})
+    for onnx in sorted(PIPER.glob("*.onnx")):
+        found.append({"id": f"model:{onnx.stem}", "name": onnx.stem, "path": onnx, "kind": "model",
+                      "language": onnx.stem.split("-")[0].replace("_", "-"), "note": "installed on the volume"})
+    return found
+
+
+def model_path_for(voice_id: str):
+    if voice_id.startswith("model:"):
+        key = voice_id.split(":", 1)[1]
+        if key == "default":
+            return Path(VOICE)
+        candidate = PIPER / f"{key}.onnx"
+        return candidate if candidate.exists() else Path(VOICE)
+    return Path(VOICE)
+
+
+def clone_meta(voice_id: str):
+    item = VOICES / f"{voice_id}.json"
+    if not item.exists():
+        return None
+    try:
+        return json.loads(item.read_text())
+    except Exception:
+        return None
+
+
+def clone_registry():
+    items = []
+    for item in sorted(VOICES.glob("*.json")):
+        try:
+            items.append(json.loads(item.read_text()))
+        except Exception:
+            continue
+    return items
+
+
+def voice_catalog():
+    return PRESETS + piper_models() + clone_registry()
+
+
+def ffmpeg(args, seconds=300):
+    proc = subprocess.run(["ffmpeg", "-y", *args], capture_output=True, timeout=seconds)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {tail(proc.stderr)}")
+
+
+def piper_say(text: str, model: Path, raw: Path):
+    proc = subprocess.run(
+        ["piper", "--model", str(model), "--output_file", str(raw)],
+        input=text.encode("utf-8"),
+        capture_output=True,
+        timeout=max(180, int(len(text) / 8)),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"voice model failed: {tail(proc.stderr)}")
+    if not raw.exists() or raw.stat().st_size == 0:
+        raise RuntimeError("the voice model produced no audio")
+
+
+BREAK = re.compile(r'<break\s+time="?(\d+(?:\.\d+)?)(ms|s)"?\s*/?>', re.IGNORECASE)
+
+
+def split_script(text: str):
+    parts = []
+    cursor = 0
+    for match in BREAK.finditer(text):
+        chunk = text[cursor:match.start()].strip()
+        if chunk:
+            parts.append(("say", chunk))
+        amount = float(match.group(1)) / (1000.0 if match.group(2).lower() == "ms" else 1.0)
+        parts.append(("pause", max(0.05, min(10.0, amount))))
+        cursor = match.end()
+    rest = text[cursor:].strip()
+    if rest:
+        parts.append(("say", rest))
+    return parts or [("say", text)]
+
+
+def chunks_of(text: str, size: int = 700):
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out, current = [], ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if len(current) + len(sentence) + 1 <= size:
+            current = f"{current} {sentence}".strip()
+        else:
+            if current:
+                out.append(current)
+            current = sentence[:size]
+    if current:
+        out.append(current)
+    return out
+
+
+def prosody_of(payload: dict, voice_id: str):
+    defaults = {}
+    if voice_id.startswith("preset:"):
+        preset = next((item for item in PRESETS if item["id"] == voice_id), None)
+        defaults = preset.get("defaults", {}) if preset else {}
+    elif voice_id.startswith("clone-"):
+        defaults = (clone_meta(voice_id) or {}).get("defaults", {}) or {}
+
+    emotion = str(payload.get("emotion") or defaults.get("emotion") or "neutral").lower()
+    curve = EMOTIONS.get(emotion, EMOTIONS["neutral"])
+
+    def pick(name, low, high, fallback):
+        raw = payload.get(name)
+        if raw in (None, ""):
+            raw = defaults.get(name, fallback)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(fallback)
+        return max(low, min(high, value))
+
+    speed = pick("speed", 0.5, 2.0, 1.0) * curve["rate"]
+    pitch = pick("pitch", -12.0, 12.0, 0.0) + curve["pitch"]
+    volume = pick("volume", 0.2, 2.0, 1.0) * curve["gain"]
+    pause = pick("pause_scale", 0.25, 3.0, 1.0) * curve["pause"]
+    return {
+        "emotion": emotion if emotion in EMOTIONS else "neutral",
+        "speed": round(max(0.5, min(2.0, speed)), 3),
+        "pitch": round(max(-12.0, min(12.0, pitch)), 2),
+        "volume": round(max(0.2, min(2.0, volume)), 3),
+        "pause": round(max(0.25, min(3.0, pause)), 2),
+    }
+
+
+def render_speech(text: str, voice_id: str, prosody: dict, out: Path, fmt: str, sample_rate: int):
+    model = model_path_for(voice_id)
+    work = RENDERS / f"tmp-{uuid.uuid4().hex[:10]}"
+    work.mkdir(parents=True, exist_ok=True)
+    pieces = []
+    try:
+        index = 0
+        for kind, value in split_script(text):
+            index += 1
+            if kind == "pause":
+                target = work / f"part-{index:04d}.wav"
+                seconds = value * prosody["pause"]
+                ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", f"{seconds:.2f}", str(target)])
+                pieces.append(target)
+                continue
+            for chunk in chunks_of(value):
+                index += 1
+                raw = work / f"raw-{index:04d}.wav"
+                spoken = work / f"part-{index:04d}.wav"
+                piper_say(chunk, model, raw)
+                ffmpeg(["-i", str(raw), "-ar", "22050", "-ac", "1", str(spoken)])
+                raw.unlink(missing_ok=True)
+                pieces.append(spoken)
+
+        if not pieces:
+            raise RuntimeError("nothing to speak")
+
+        listing = work / "parts.txt"
+        listing.write_text("".join(f"file '{piece.name}'\n" for piece in pieces))
+        joined = work / "joined.wav"
+        ffmpeg(["-f", "concat", "-safe", "0", "-i", str(listing), str(joined)])
+
+        chain = []
+        speed = prosody["speed"]
+        while speed > 2.0:
+            chain.append("atempo=2.0")
+            speed /= 2.0
+        while speed < 0.5:
+            chain.append("atempo=0.5")
+            speed /= 0.5
+        if abs(speed - 1.0) > 0.01:
+            chain.append(f"atempo={speed:.3f}")
+        if abs(prosody["pitch"]) > 0.01:
+            factor = 2 ** (prosody["pitch"] / 12.0)
+            keep = max(0.5, min(2.0, 1.0 / factor))
+            chain.append(f"asetrate={int(sample_rate * factor)}")
+            chain.append(f"aresample={sample_rate}")
+            chain.append(f"atempo={keep:.3f}")
+        chain.append(f"volume={prosody['volume']:.3f}")
+        codec = ["-codec:a", "libmp3lame", "-b:a", "192k"] if fmt == "mp3" else ["-codec:a", "pcm_s16le"]
+        ffmpeg(["-i", str(joined), "-af", ",".join(chain), "-ar", str(sample_rate), "-ac", "1", *codec, str(out)])
+        if not out.exists() or out.stat().st_size == 0:
+            raise RuntimeError("the render produced no audio")
+    finally:
+        for leftover in work.glob("*"):
+            leftover.unlink(missing_ok=True)
+        work.rmdir()
+
+
+def voice_entry(job_id: str, fmt: str):
+    return {"job_id": job_id, "format": fmt, "url": f"/voice/{job_id}.{fmt}"}
 
 
 @app.get("/voices")
 def list_voices(authorization: Optional[str] = Header(None)):
     auth(authorization)
-    clones = []
-    for item in sorted(VOICES.glob("*.json")):
-        try:
-            clones.append(json.loads(item.read_text()))
-        except Exception:
-            continue
-    return {"ok": True, "voices": VOICE_PRESETS + clones}
+    return {
+        "ok": True,
+        "voices": voice_catalog(),
+        "emotions": list(EMOTIONS.keys()),
+        "max_chars": MAX_CHARS,
+    }
+
+
+@app.post("/voices/install")
+def install_voice(payload: dict, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    key = str(payload.get("voice") or "").strip()
+    if not key or key.count("-") < 2:
+        raise HTTPException(400, "voice must look like en_US-lessac-medium")
+    locale, name, quality = key.split("-", 2)
+    family = locale.split("_")[0]
+    base = f"{HF_VOICES}/{family}/{locale}/{name}/{quality}/{key}"
+    target = PIPER / f"{key}.onnx"
+    config = PIPER / f"{key}.onnx.json"
+    try:
+        for url, destination in ((f"{base}.onnx", target), (f"{base}.onnx.json", config)):
+            if destination.exists():
+                continue
+            with urllib.request.urlopen(url, timeout=180) as response:
+                destination.write_bytes(response.read())
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        config.unlink(missing_ok=True)
+        raise HTTPException(404, f"that voice is not in the Piper catalogue ({type(exc).__name__})")
+    return {"ok": True, "voice": {"id": f"model:{key}", "name": key, "kind": "model", "bytes": target.stat().st_size}}
 
 
 @app.post("/speak")
@@ -241,29 +481,41 @@ def speak_text(payload: dict, authorization: Optional[str] = Header(None)):
     if len(text) > MAX_CHARS:
         raise HTTPException(400, f"text is limited to {MAX_CHARS} characters")
     voice_id = str(payload.get("voice_id") or "preset:river")
-    if voice_id.startswith("clone-"):
-        raise HTTPException(
-            409,
-            "Clone synthesis needs the XTTS-v2 engine, which this container does not carry. "
-            "The reference audio is stored and kept on the volume.",
-        )
+    fmt = "mp3" if str(payload.get("format", "wav")).lower() == "mp3" else "wav"
+    try:
+        sample_rate = int(str(payload.get("sample_rate") or 24000))
+    except (TypeError, ValueError):
+        sample_rate = 24000
+    sample_rate = max(16000, min(48000, sample_rate))
+    prosody = prosody_of(payload, voice_id)
+
     job_id = f"sp-{uuid.uuid4().hex[:12]}"
-    out = RENDERS / f"{job_id}.wav"
-    speak(text, out)
-    return {
-        "ok": True,
-        "job_id": job_id,
+    out = RENDERS / f"{job_id}.{fmt}"
+    try:
+        render_speech(text, voice_id, prosody, out, fmt, sample_rate)
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc))
+    meta = {
+        **voice_entry(job_id, fmt),
         "voice_id": voice_id,
-        "bytes": out.stat().st_size,
-        "url": f"/voice/{job_id}.wav",
+        "voice_name": next((item["name"] for item in voice_catalog() if item["id"] == voice_id), voice_id),
+        "prosody": prosody,
         "chars": len(text),
+        "bytes": out.stat().st_size,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    (RENDERS / f"{job_id}.json").write_text(json.dumps(meta))
+    return {"ok": True, **meta}
 
 
 @app.post("/clone")
 async def upload_clone(
     file: UploadFile = File(...),
     name: str = Form("Unnamed clone"),
+    speed: str = Form("1.0"),
+    pitch: str = Form("0"),
+    volume: str = Form("1.0"),
+    emotion: str = Form("neutral"),
     authorization: Optional[str] = Header(None),
 ):
     auth(authorization)
@@ -275,12 +527,30 @@ async def upload_clone(
     if payload[:4] != b"RIFF":
         raise HTTPException(400, "reference audio must be a WAV file")
     voice_id = f"clone-{uuid.uuid4().hex[:12]}"
-    (VOICES / f"{voice_id}.wav").write_bytes(payload)
+    reference = VOICES / f"{voice_id}.wav"
+    reference.write_bytes(payload)
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(reference)],
+        capture_output=True,
+        timeout=60,
+    )
+    try:
+        duration = round(float(probe.stdout.decode().strip() or 0), 2)
+    except ValueError:
+        duration = 0.0
     meta = {
         "id": voice_id,
         "name": (name or "Unnamed clone")[:80],
         "kind": "clone",
+        "language": "en-US",
         "bytes": len(payload),
+        "reference_seconds": duration,
+        "defaults": {
+            "speed": float(speed or 1.0),
+            "pitch": float(pitch or 0),
+            "volume": float(volume or 1.0),
+            "emotion": emotion if emotion in EMOTIONS else "neutral",
+        },
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "note": "reference audio is private to this volume",
     }
@@ -288,8 +558,52 @@ async def upload_clone(
     return {"ok": True, "voice": meta}
 
 
-# The .wav route is registered before the plain id route: a path parameter matches dots, so the
-# other order answers a download with a JSON lookup.
+@app.delete("/clone/{voice_id}")
+def delete_clone(voice_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    if not clone_meta(voice_id):
+        raise HTTPException(404, "No such clone")
+    (VOICES / f"{voice_id}.json").unlink(missing_ok=True)
+    (VOICES / f"{voice_id}.wav").unlink(missing_ok=True)
+    return {"ok": True, "deleted": voice_id}
+
+
+@app.get("/clone/{voice_id}/reference")
+def clone_reference(voice_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    path = VOICES / f"{voice_id}.wav"
+    if not path.exists():
+        raise HTTPException(404, "No reference audio for that clone")
+    return FileResponse(path, media_type="audio/wav", filename=f"{voice_id}.wav")
+
+
+@app.get("/voice/history")
+def voice_history(limit: int = 40, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    items = []
+    for item in RENDERS.glob("sp-*.json"):
+        try:
+            items.append(json.loads(item.read_text()))
+        except Exception:
+            continue
+    items.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+    return {"ok": True, "count": len(items), "items": items[: max(1, min(200, limit))]}
+
+
+@app.delete("/voice/{job_id}")
+def delete_voice(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    removed = False
+    for suffix in ("wav", "mp3", "json"):
+        path = RENDERS / f"{job_id}.{suffix}"
+        if path.exists():
+            path.unlink()
+            removed = True
+    if not removed:
+        raise HTTPException(404, "No such render")
+    return {"ok": True, "deleted": job_id}
+
+
 @app.get("/voice/{job_id}.wav")
 def get_voice_wav(job_id: str, authorization: Optional[str] = Header(None)):
     auth(authorization)
@@ -299,9 +613,21 @@ def get_voice_wav(job_id: str, authorization: Optional[str] = Header(None)):
     return FileResponse(path, media_type="audio/wav", filename=f"{job_id}.wav")
 
 
+@app.get("/voice/{job_id}.mp3")
+def get_voice_mp3(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    path = RENDERS / f"{job_id}.mp3"
+    if not path.exists():
+        raise HTTPException(404, "No such render")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{job_id}.mp3")
+
+
 @app.get("/voice/{job_id}")
 def get_voice_meta(job_id: str, authorization: Optional[str] = Header(None)):
     auth(authorization)
+    meta = RENDERS / f"{job_id}.json"
+    if meta.exists():
+        return {"ok": True, **json.loads(meta.read_text())}
     path = RENDERS / f"{job_id}.wav"
     if not path.exists():
         raise HTTPException(404, "No such render")
