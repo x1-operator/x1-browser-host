@@ -1,0 +1,4 @@
+# Optional layer: the clone engine. Adds ~2.5 GB of weights and torch, so it is a separate install
+# rather than part of the base image. Build with --build-arg WITH_CLONE=true to include it.
+coqui-tts==0.24.2
+torch==2.2.2
