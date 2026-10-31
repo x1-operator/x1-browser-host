@@ -26,7 +26,7 @@ RUN git clone --depth 1 https://github.com/Rudrabha/Wav2Lip /opt/wav2lip \
     && curl -fsSL -o /opt/voices/voice.onnx \
          https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx \
     && curl -fsSL -o /opt/voices/voice.onnx.json \
-         https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
+         https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json \
     && sed -i 's/librosa\.filters\.mel(hp\.sample_rate, hp\.n_fft/librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft/' \
         /opt/wav2lip/audio.py \
     && grep -n "mel(sr=hp.sample_rate" /opt/wav2lip/audio.py
