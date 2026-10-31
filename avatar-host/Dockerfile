@@ -14,6 +14,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Wav2Lip calls librosa.filters.mel positionally, which librosa 0.10+ refuses
+# ("mel() takes 0 positional arguments but 2 were given"). Patch the call at build so a
+# render works on whichever librosa the image resolves.
 RUN git clone --depth 1 https://github.com/Rudrabha/Wav2Lip /opt/wav2lip \
     && mkdir -p /opt/wav2lip/checkpoints /opt/wav2lip/face_detection/detection/sfd /opt/voices \
     && curl -fsSL -o /opt/wav2lip/checkpoints/wav2lip_gan.pth \
