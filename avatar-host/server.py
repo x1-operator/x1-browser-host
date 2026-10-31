@@ -1,7 +1,10 @@
-"""X1 avatar host - the app's own talking-portrait service."""
+"""X1 avatar host — the app's own talking-portrait service.
 
-import hashlib
-import hmac
+Nothing here is rented: one container holds HER image exactly as uploaded (no moderation, no
+re-encode), turns text into speech with a local voice model, and re-syncs her mouth to that audio
+with Wav2Lip. One bearer token guards everything.
+"""
+
 import os
 import subprocess
 import threading
@@ -30,8 +33,6 @@ RENDERS.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="X1 avatar host")
 JOBS = {}
-for _existing in RENDERS.glob("*.mp4"):
-    JOBS.setdefault(_existing.stem, {"id": _existing.stem, "status": "done", "chars": 0, "text": "", "video_url": "/renders/" + _existing.stem + ".mp4"})
 LOCK = threading.Lock()
 USAGE = {"renders": 0, "seconds": 0.0, "started_at": time.time()}
 
@@ -43,26 +44,12 @@ def auth(authorization: Optional[str]):
         raise HTTPException(401, "Unauthorized")
 
 
-def allow(authorization: Optional[str], path: str, exp: Optional[str], sig: Optional[str]):
-    """Bearer token, or a short-lived signature the app mints for a video/image tag."""
-    if authorization and TOKEN and authorization.replace("Bearer ", "").strip() == TOKEN:
-        return
-    if exp and sig:
-        try:
-            if int(exp) >= time.time():
-                want = hmac.new(TOKEN.encode(), (path + "." + str(exp)).encode(), hashlib.sha256).hexdigest()
-                if hmac.compare_digest(want, sig):
-                    return
-        except ValueError:
-            pass
-    raise HTTPException(401, "Unauthorized")
-
-
 def tail(text: bytes, size: int = 400) -> str:
     return text.decode("utf-8", "replace")[-size:]
 
 
 def speak(text: str, wav: Path):
+    """Text → 16 kHz mono WAV with the local voice model."""
     raw = wav.with_suffix(".raw.wav")
     proc = subprocess.run(
         ["piper", "--model", VOICE, "--output_file", str(raw)],
@@ -71,7 +58,7 @@ def speak(text: str, wav: Path):
         timeout=180,
     )
     if proc.returncode != 0:
-        raise RuntimeError("voice model failed: " + tail(proc.stderr))
+        raise RuntimeError(f"voice model failed: {tail(proc.stderr)}")
     conv = subprocess.run(
         ["ffmpeg", "-y", "-i", str(raw), "-ar", "16000", "-ac", "1", str(wav)],
         capture_output=True,
@@ -79,30 +66,40 @@ def speak(text: str, wav: Path):
     )
     raw.unlink(missing_ok=True)
     if conv.returncode != 0:
-        raise RuntimeError("audio convert failed: " + tail(conv.stderr))
+        raise RuntimeError(f"audio convert failed: {tail(conv.stderr)}")
     if not wav.exists() or wav.stat().st_size == 0:
         raise RuntimeError("the voice model produced no audio")
 
 
 def animate(wav: Path, out: Path):
+    """Her exact still + that audio → an mp4 whose mouth follows the words."""
     cmd = [
-        "python", "inference.py",
-        "--checkpoint_path", "checkpoints/wav2lip_gan.pth",
-        "--face", str(AVATAR),
-        "--audio", str(wav),
-        "--outfile", str(out),
-        "--pads", "0", "12", "0", "0",
+        "python",
+        "inference.py",
+        "--checkpoint_path",
+        "checkpoints/wav2lip_gan.pth",
+        "--face",
+        str(AVATAR),
+        "--audio",
+        str(wav),
+        "--outfile",
+        str(out),
+        "--pads",
+        "0",
+        "12",
+        "0",
+        "0",
         "--nosmooth",
     ]
     proc = subprocess.run(cmd, cwd=str(WAV2LIP), capture_output=True, timeout=MAX_RENDER_SECONDS)
     if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
-        raise RuntimeError("animation failed: " + tail(proc.stderr or proc.stdout))
+        raise RuntimeError(f"animation failed: {tail(proc.stderr or proc.stdout)}")
 
 
 def run_job(job_id: str, text: str):
     job = JOBS[job_id]
-    wav = RENDERS / (job_id + ".wav")
-    out = RENDERS / (job_id + ".mp4")
+    wav = RENDERS / f"{job_id}.wav"
+    out = RENDERS / f"{job_id}.mp4"
     started = time.time()
     try:
         job["status"] = "speaking"
@@ -110,11 +107,11 @@ def run_job(job_id: str, text: str):
         job["status"] = "animating"
         animate(wav, out)
         job["status"] = "done"
-        job["video_url"] = "/renders/" + job_id + ".mp4"
+        job["video_url"] = f"/renders/{job_id}.mp4"
         with LOCK:
             USAGE["renders"] += 1
             USAGE["seconds"] += round(time.time() - started, 1)
-    except Exception as error:
+    except Exception as error:  # surfaced to the caller, never swallowed
         job["status"] = "failed"
         job["error"] = str(error)[:400]
     finally:
@@ -144,14 +141,16 @@ async def upload_avatar(file: UploadFile = File(...), authorization: Optional[st
     payload = await file.read()
     if not payload:
         raise HTTPException(400, "The image arrived empty")
-    AVATAR.write_bytes(payload)
-    AVATAR_META.write_text('{"name":"' + (file.filename or "avatar") + '","bytes":' + str(len(payload)) + '}')
-    return {"ok": True, "bytes": len(payload), "name": file.filename}
+    AVATAR.write_bytes(payload)  # byte-for-byte, never re-encoded
+    AVATAR_META.write_text(
+        f'{{"name":"{file.filename or "avatar"}","bytes":{len(payload)},"at":{int(time.time())}}}'
+    )
+    return {"ok": True, "bytes": len(payload), "name": file.filename, "stored": str(AVATAR)}
 
 
 @app.get("/avatar")
-def get_avatar(authorization: Optional[str] = Header(None), exp: Optional[str] = None, sig: Optional[str] = None):
-    allow(authorization, "/avatar", exp, sig)
+def get_avatar(authorization: Optional[str] = Header(None)):
+    auth(authorization)
     if not AVATAR.exists():
         raise HTTPException(404, "No image has been uploaded yet")
     return FileResponse(AVATAR)
@@ -164,11 +163,18 @@ def render(payload: dict, authorization: Optional[str] = Header(None)):
     if not text:
         raise HTTPException(400, "text is required")
     if len(text) > MAX_CHARS:
-        raise HTTPException(400, "text is limited to " + str(MAX_CHARS) + " characters")
+        raise HTTPException(400, f"text is limited to {MAX_CHARS} characters")
     if not AVATAR.exists():
         raise HTTPException(400, "Upload her image first (POST /avatar)")
+
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"id": job_id, "status": "queued", "text": text[:200], "chars": len(text), "created_at": time.time()}
+    JOBS[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "text": text[:200],
+        "chars": len(text),
+        "created_at": time.time(),
+    }
     threading.Thread(target=run_job, args=(job_id, text), daemon=True).start()
     return {"ok": True, "job": JOBS[job_id]}
 
@@ -180,10 +186,12 @@ def list_renders(authorization: Optional[str] = Header(None)):
     return {"ok": True, "count": len(items), "items": items[:50], "usage": USAGE}
 
 
+# Registered before the plain job route: "/renders/<id>" also matches "/renders/<id>.mp4",
+# so the video route has to win the match or every download 404s as an unknown job.
 @app.get("/renders/{job_id}.mp4")
-def get_video(job_id: str, authorization: Optional[str] = Header(None), exp: Optional[str] = None, sig: Optional[str] = None):
-    allow(authorization, "/renders/" + job_id + ".mp4", exp, sig)
-    path = RENDERS / (job_id + ".mp4")
+def get_video(job_id: str, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    path = RENDERS / f"{job_id}.mp4"
     if not path.exists():
         raise HTTPException(404, "That render has no video yet")
     return FileResponse(path, media_type="video/mp4")
